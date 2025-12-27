@@ -19,8 +19,10 @@ def main():
     parser.add_argument("--steps", type=int, default=20, help="Inference steps")
     parser.add_argument("--cfg_scale", type=float, default=1.0, help="CFG scale")
     parser.add_argument("--embedded_guidance", type=float, default=3.5, help="Embedded guidance")
+    parser.add_argument("--controlnet_scale", type=float, default=1.0, help="ControlNet conditioning scale")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--lora_target", type=str, default="dit", choices=["dit", "controlnet"], help="Which module to load LoRA into")
     args = parser.parse_args()
     
     print(f"\n{'='*60}")
@@ -47,11 +49,11 @@ def main():
     # Model configs
     print("[2/4] Loading models...")
     model_configs = [
-        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="flux1-dev.safetensors"),
-        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="ae.safetensors"),
-        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder/model.safetensors"),
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="flux1-dev.safetensors", **vram_config),
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="ae.safetensors", **vram_config),
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder/model.safetensors", **vram_config),
         ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder_2/*.safetensors", **vram_config),
-        ModelConfig(model_id="jasperai/Flux.1-dev-Controlnet-Upscaler", origin_file_pattern="diffusion_pytorch_model.safetensors"),
+        ModelConfig(model_id="InstantX/FLUX.1-dev-Controlnet-Union-alpha", origin_file_pattern="diffusion_pytorch_model.safetensors", **vram_config),
     ]
     
     # Load pipeline
@@ -59,24 +61,31 @@ def main():
         torch_dtype=torch.bfloat16,
         device=args.device,
         model_configs=model_configs,
+        vram_limit=torch.cuda.mem_get_info()[1] / (1024 ** 3) - 0.5,
     )
     
     # Load LoRA
     print(f"[3/4] Loading LoRA from: {args.lora_checkpoint}")
-    pipe.load_lora([args.lora_checkpoint])
+    target_module = pipe.dit if args.lora_target == "dit" else pipe.controlnet
+    if target_module is None:
+        raise RuntimeError(f"Selected lora_target={args.lora_target} but module is None (controlnet not loaded?)")
+    pipe.load_lora(target_module, args.lora_checkpoint, alpha=1.0)
     
     # Load SPAD image
     print(f"[4/4] Loading SPAD image: {args.control_image}")
     control_img = Image.open(args.control_image).convert("RGB")
     
     # Create ControlNet input
-    controlnet_inputs = [ControlNetInput(image=control_img)]
+    controlnet_inputs = [ControlNetInput(image=control_img, processor_id="gray", scale=args.controlnet_scale)]
     
     # Generate
     print(f"\nGenerating RGB output ({args.steps} steps)...")
+    print(f"[Inference] Parameters: height={args.height}, width={args.width}, steps={args.steps}, cfg={args.cfg_scale}, guidance={args.embedded_guidance}, seed={args.seed}")
     output = pipe(
         prompt=args.prompt,
+        input_image=None,  # ControlNet-only generation (no GT conditioning) - MUST match training
         controlnet_inputs=controlnet_inputs,  # SPAD conditioning
+        denoising_strength=1.0,  # Full generation from noise - MUST match training
         height=args.height,
         width=args.width,
         num_inference_steps=args.steps,

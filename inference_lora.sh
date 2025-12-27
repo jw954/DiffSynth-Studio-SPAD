@@ -12,6 +12,7 @@ OUTPUT="./output_rgb.png"
 # Run inference
 python inference_lora.py \
   --lora_checkpoint "${LORA_CHECKPOINT}" \
+  --lora_target controlnet \
   --control_image "${SPAD_IMAGE}" \
   --output "${OUTPUT}" \
   --prompt "" \
@@ -20,6 +21,7 @@ python inference_lora.py \
   --steps 20 \
   --cfg_scale 1.0 \
   --embedded_guidance 3.5 \
+  --controlnet_scale 1.0 \
   --seed 42
 
 echo ""

@@ -80,9 +80,19 @@ class FluxTrainingModule(DiffusionTrainingModule):
         }
         # Parse extra inputs (controlnet_image, etc.)
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
+        
+        # Union-alpha ControlNet requires processor_id - default to "gray" for SPAD images
+        if "controlnet_inputs" in inputs_shared:
+            for ctrl_input in inputs_shared["controlnet_inputs"]:
+                if ctrl_input.processor_id is None:
+                    ctrl_input.processor_id = "gray"  # SPAD images are grayscale
+        
         return inputs_shared, inputs_posi, inputs_nega
     
     def forward(self, data, inputs=None):
+        # In case an inference call (e.g., image logging) changed scheduler state, restore training schedule.
+        if (not getattr(self.pipe.scheduler, "training", False)) or (len(self.pipe.scheduler.timesteps) != self.pipe.scheduler.num_train_timesteps):
+            self.pipe.scheduler.set_timesteps(self.pipe.scheduler.num_train_timesteps, training=True)
         if inputs is None: inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
@@ -103,6 +113,8 @@ def flux_parser():
     parser.add_argument("--log_dir", type=str, default="./logs/flux_spad_lora", help="TensorBoard log directory")
     parser.add_argument("--log_freq", type=int, default=300, help="Scalar logging frequency (steps)")
     parser.add_argument("--image_log_freq", type=int, default=1000, help="Image logging frequency (steps)")
+    # Validation
+    parser.add_argument("--val_metadata_path", type=str, default=None, help="Optional validation CSV for periodic eval")
     return parser
 
 
@@ -186,16 +198,19 @@ def log_sample_images(model, data, tb_writer, global_step, device="cuda"):
             # 3. Generate sample using current LoRA + ControlNet
             print(f"[Step {global_step}] Generating sample with ControlNet...")
             
-            # Create ControlNetInput wrapper for inference
-            controlnet_inputs = [ControlNetInput(image=controlnet_img_pil)]
+            # Create ControlNetInput wrapper for inference (Union-alpha needs processor_id)
+            controlnet_inputs = [ControlNetInput(image=controlnet_img_pil, processor_id="gray")]
+            
+            # Match generation resolution to training crop to avoid latent/noise mismatch
+            target_h, target_w = model.pipe.check_resize_height_width(gt_img_pil.height, gt_img_pil.width)
             
             generated = pipe(
                 prompt=prompt,
-                input_image=gt_img_pil,  # Ground truth for denoising_strength
+                input_image=None,  # ControlNet-only generation (no GT conditioning)
                 controlnet_inputs=controlnet_inputs,  # SPAD conditioning
                 denoising_strength=1.0,  # Full generation from noise
-                height=448,  # Match training size (reduced for VRAM)
-                width=448,
+                height=target_h,
+                width=target_w,
                 num_inference_steps=10,  # Fast sampling
                 cfg_scale=1.0,
                 embedded_guidance=3.5,
@@ -203,8 +218,8 @@ def log_sample_images(model, data, tb_writer, global_step, device="cuda"):
                 rand_device=device,
             )
             
-            # CRITICAL: Restore scheduler to training mode
-            pipe.scheduler.set_timesteps(1000, training=True)
+            # CRITICAL: Restore scheduler to training mode after inference
+            pipe.scheduler.set_timesteps(pipe.scheduler.num_train_timesteps, training=True)
             
             # Convert generated PIL to tensor
             gen_np = np.array(generated)
@@ -227,6 +242,11 @@ def log_sample_images(model, data, tb_writer, global_step, device="cuda"):
             import traceback
             print(f"Warning: Image logging failed: {e}")
             traceback.print_exc()
+            # Ensure training scheduler is restored even if logging fails
+            try:
+                model.pipe.scheduler.set_timesteps(model.pipe.scheduler.num_train_timesteps, training=True)
+            except Exception:
+                pass
     
     model.train()
 
@@ -242,6 +262,7 @@ def parse_resume_epoch(checkpoint_path):
 def launch_training_with_logging(
     accelerator: accelerate.Accelerator,
     dataset: torch.utils.data.Dataset,
+    val_dataloader: torch.utils.data.DataLoader,
     model: DiffusionTrainingModule,
     model_logger: ModelLogger,
     tb_writer: SummaryWriter,
@@ -261,6 +282,9 @@ def launch_training_with_logging(
     save_steps = args.save_steps
     num_epochs = args.num_epochs
     
+    print(f"[Config] save_steps={save_steps} (None means save every epoch)")
+    print(f"[Config] num_epochs={num_epochs}")
+    
     start_epoch = 0 if resume_epoch is None else resume_epoch + 1
     if start_epoch > 0:
         print(f"\n{'='*60}")
@@ -279,10 +303,29 @@ def launch_training_with_logging(
     )
     
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    if val_dataloader is not None:
+        val_dataloader = accelerator.prepare(val_dataloader)
     
     # Calculate global_step for resume
     steps_per_epoch = len(dataloader)
     global_step = start_epoch * steps_per_epoch
+    last_val_loss = None
+    
+    def evaluate_validation_loss():
+        if val_dataloader is None:
+            return None
+        model.eval()
+        losses = []
+        progress = tqdm(val_dataloader, desc="Val", disable=not accelerator.is_local_main_process)
+        with torch.no_grad():
+            for val_data in progress:
+                loss = model(val_data)
+                gathered = accelerator.gather_for_metrics(loss.detach())
+                losses.append(gathered.mean().item())
+        model.train()
+        if len(losses) == 0:
+            return None
+        return sum(losses) / len(losses)
     
     # Training loop
     for epoch_id in range(start_epoch, num_epochs):
@@ -320,27 +363,53 @@ def launch_training_with_logging(
                 # TensorBoard images
                 if global_step % image_log_freq == 0 and accelerator.is_main_process:
                     try:
+                        print(f"[Image Log] Logging images at step {global_step}...")
                         log_sample_images(model, data, tb_writer, global_step, accelerator.device)
+                        print(f"[Image Log] ✓ Logged images at step {global_step}")
                     except Exception as e:
-                        print(f"Warning: Image logging failed: {e}")
+                        print(f"[Image Log] ✗ Failed to log images at step {global_step}: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
                 # Update progress
-                progress_bar.set_postfix({
+                postfix = {
                     'loss': f'{loss_value:.4f}',
                     'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
                     'step': global_step
-                })
+                }
+                if last_val_loss is not None:
+                    postfix['val'] = f'{last_val_loss:.4f}'
+                progress_bar.set_postfix(postfix)
                 
                 # Checkpoint saving
                 model_logger.on_step_end(accelerator, model, save_steps)
         
         # Epoch end
         avg_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0
-        print(f"\n[Epoch {epoch_id+1}] Average loss: {avg_loss:.4f}")
+        print(f"\n[Epoch {epoch_id+1}/{num_epochs}] Average loss: {avg_loss:.4f}")
         tb_writer.add_scalar("train/epoch_loss", avg_loss, epoch_id)
         
+        # Validation (optional)
+        if accelerator.is_main_process and val_dataloader is not None:
+            print(f"[Val] Evaluating on validation set...")
+        val_loss = evaluate_validation_loss()
+        if val_loss is not None and accelerator.is_main_process:
+            print(f"[Val] Epoch {epoch_id+1} validation loss: {val_loss:.4f}")
+            tb_writer.add_scalar("val/loss", val_loss, global_step)
+            last_val_loss = val_loss
+        
+        # Save checkpoint at end of each epoch (if save_steps is None)
         if save_steps is None:
-            model_logger.on_epoch_end(accelerator, model, epoch_id)
+            print(f"[Checkpoint] Saving epoch {epoch_id} checkpoint...")
+            try:
+                model_logger.on_epoch_end(accelerator, model, epoch_id)
+                print(f"[Checkpoint] ✓ Saved epoch {epoch_id} checkpoint")
+            except Exception as e:
+                print(f"[Checkpoint] ✗ Failed to save checkpoint: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"[Checkpoint] Skipping epoch save (save_steps={save_steps})")
     
     # Training end
     model_logger.on_training_end(accelerator, model, save_steps)
@@ -376,10 +445,39 @@ if __name__ == "__main__":
     )
     print(f"[Dataset] {len(dataset)} samples (repeat={args.dataset_repeat})")
     
+    # Validation dataset (optional)
+    val_dataloader = None
+    if args.val_metadata_path is not None:
+        print(f"[Val Dataset] Loading from: {args.val_metadata_path}")
+        val_dataset = UnifiedDataset(
+            base_path=args.dataset_base_path,
+            metadata_path=args.val_metadata_path,
+            repeat=1,
+            data_file_keys=args.data_file_keys.split(","),
+            main_data_operator=UnifiedDataset.default_image_operator(
+                base_path=args.dataset_base_path,
+                max_pixels=args.max_pixels,
+                height=args.height,
+                width=args.width,
+                height_division_factor=16,
+                width_division_factor=16,
+            )
+        )
+        print(f"[Val Dataset] {len(val_dataset)} samples")
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            shuffle=False,
+            collate_fn=lambda x: x[0],
+            num_workers=args.dataset_num_workers
+        )
+    
     # Resume epoch
     resume_epoch = parse_resume_epoch(args.lora_checkpoint)
     if resume_epoch is not None:
         print(f"[Resume] Detected checkpoint from epoch {resume_epoch}")
+    start_epoch = 0 if resume_epoch is None else resume_epoch + 1
+    if start_epoch >= args.num_epochs:
+        raise ValueError(f"Resume epoch {resume_epoch} is >= num_epochs ({args.num_epochs}). Increase --num_epochs to continue training.")
     
     # Model
     print(f"[Model] Initializing FLUX ControlNet LoRA...")
@@ -405,6 +503,8 @@ if __name__ == "__main__":
     )
     
     # Model logger (checkpoints)
+    output_path_abs = os.path.abspath(args.output_path)
+    print(f"[Checkpoint] Output directory: {output_path_abs}")
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
@@ -421,7 +521,7 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Starting FLUX ControlNet LoRA Training")
     print(f"{'='*60}")
-    print(f"  Epochs: {start_epoch if resume_epoch else 0} → {args.num_epochs - 1}")
+    print(f"  Epochs: {start_epoch} → {args.num_epochs - 1}")
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  LoRA rank: {args.lora_rank}")
     print(f"  Checkpoints: {args.output_path}")
@@ -430,6 +530,7 @@ if __name__ == "__main__":
     launch_training_with_logging(
         accelerator=accelerator,
         dataset=dataset,
+        val_dataloader=val_dataloader,
         model=model,
         model_logger=model_logger,
         tb_writer=tb_writer,

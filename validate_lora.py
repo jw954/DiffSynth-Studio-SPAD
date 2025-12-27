@@ -10,17 +10,24 @@ from PIL import Image
 import csv
 
 from diffsynth.pipelines.flux_image import FluxImagePipeline, ModelConfig
-
+from diffsynth.utils.controlnet import ControlNetInput
+from diffsynth.utils.lora.flux import FluxLoRALoader
+from diffsynth.core import load_state_dict
 
 def main():
     parser = argparse.ArgumentParser(description="FLUX LoRA validation on val set")
     parser.add_argument("--lora_checkpoint", type=str, required=True, help="Path to LoRA checkpoint")
+    parser.add_argument("--lora_target", type=str, default="dit", choices=["dit", "controlnet"], help="Which module to load LoRA into")
     parser.add_argument("--metadata_csv", type=str, default="/home/jw/engsci/thesis/spad/spad_dataset/metadata_val.csv", help="Validation CSV")
     parser.add_argument("--output_dir", type=str, default="./validation_outputs", help="Output directory")
     parser.add_argument("--steps", type=int, default=28, help="Inference steps")
     parser.add_argument("--cfg_scale", type=float, default=1.0, help="CFG scale")
     parser.add_argument("--embedded_guidance", type=float, default=3.5, help="Embedded guidance")
     parser.add_argument("--denoising_strength", type=float, default=1.0, help="Denoising strength")
+    parser.add_argument("--height", type=int, default=512, help="Output height (match training resolution)")
+    parser.add_argument("--width", type=int, default=512, help="Output width (match training resolution)")
+    parser.add_argument("--controlnet_scale", type=float, default=1.0, help="ControlNet conditioning scale")
+    parser.add_argument("--processor_id", type=str, default="gray", help="ControlNet processor id for SPAD inputs")
     parser.add_argument("--max_samples", type=int, default=None, help="Max samples (None=all)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
@@ -67,22 +74,40 @@ def main():
         "computation_device": "cuda",
     }
     
-    vram_limit = torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 0.5
+    vram_limit = torch.cuda.mem_get_info()[1] / (1024 ** 3) - 0.5
+    model_configs = [
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="flux1-dev.safetensors", **vram_config),
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder/model.safetensors", **vram_config),
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder_2/*.safetensors", **vram_config),
+        ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="ae.safetensors", **vram_config),
+        ModelConfig(model_id="InstantX/FLUX.1-dev-Controlnet-Union-alpha", origin_file_pattern="diffusion_pytorch_model.safetensors", **vram_config),
+    ]
     
     pipe = FluxImagePipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device="cuda",
-        model_configs=[
-            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="flux1-dev.safetensors", **vram_config),
-            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder/model.safetensors", **vram_config),
-            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="text_encoder_2/*.safetensors", **vram_config),
-            ModelConfig(model_id="black-forest-labs/FLUX.1-dev", origin_file_pattern="ae.safetensors", **vram_config),
-        ],
+        model_configs=model_configs,
         vram_limit=vram_limit,
     )
     
-    print(f"Loading LoRA: {args.lora_checkpoint}")
-    pipe.load_lora(pipe.dit, args.lora_checkpoint, alpha=1.0)
+    print(f"Loading LoRA ({args.lora_target}): {args.lora_checkpoint}")
+    target_module = pipe.dit if args.lora_target == "dit" else pipe.controlnet
+    if target_module is None:
+        raise RuntimeError(f"Selected lora_target={args.lora_target} but module is None (controlnet not loaded?)")
+    if args.lora_target == "controlnet":
+        # Debug: compute match counts before fuse
+        state_dict = load_state_dict(args.lora_checkpoint, torch_dtype=pipe.torch_dtype, device=pipe.device)
+        # Use FluxLoRALoader directly to fuse and see match count
+        loader = FluxLoRALoader(torch_dtype=pipe.torch_dtype, device=pipe.device)
+        # Compute lora layer names
+        name_dict = loader.get_name_dict(state_dict)
+        lora_layer_names = set([n for n in name_dict])
+        module_names = set([n for n, _ in target_module.named_modules()])
+        matched = lora_layer_names & module_names
+        print(f"[LoRA Debug] controlnet modules: {len(module_names)}, lora layers: {len(lora_layer_names)}, intersect: {len(matched)}")
+        loader.fuse_lora_to_base_model(target_module, state_dict, alpha=1.0)
+    else:
+        pipe.load_lora(target_module, args.lora_checkpoint, alpha=1.0)
     
     # Run inference
     print("Running inference on validation set...")
@@ -90,20 +115,28 @@ def main():
     
     for idx, sample in enumerate(tqdm(samples, desc="Generating")):
         # Load SPAD input and ground truth
-        input_path = csv_base / sample['input_image']
+        controlnet_key = "controlnet_image" if "controlnet_image" in sample else "input_image"
+        if controlnet_key not in sample:
+            raise KeyError(f"Missing control image column in CSV. Expected 'controlnet_image' (or legacy 'input_image'), got keys: {list(sample.keys())}")
+        
+        input_path = csv_base / sample[controlnet_key]
         gt_path = csv_base / sample['image']
         
-        input_img = Image.open(input_path).convert('RGB')
+        control_img = Image.open(input_path).convert('RGB')
         gt_img = Image.open(gt_path).convert('RGB')
         
         # Generate
         with torch.no_grad():
             result = pipe(
                 prompt=sample.get('prompt', ''),
-                input_image=input_img,
+                controlnet_inputs=[ControlNetInput(
+                    image=control_img,
+                    processor_id=args.processor_id,
+                    scale=args.controlnet_scale,
+                )],
                 denoising_strength=args.denoising_strength,
-                height=512,
-                width=512,
+                height=args.height,
+                width=args.width,
                 num_inference_steps=args.steps,
                 cfg_scale=args.cfg_scale,
                 embedded_guidance=args.embedded_guidance,
@@ -112,7 +145,7 @@ def main():
             )
         
         # Save
-        input_img.save(output_dir / "input" / f"input_{idx:04d}.png")
+        control_img.save(output_dir / "input" / f"input_{idx:04d}.png")
         result.save(output_dir / "output" / f"output_{idx:04d}.png")
         gt_img.save(output_dir / "ground_truth" / f"gt_{idx:04d}.png")
     
@@ -125,5 +158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

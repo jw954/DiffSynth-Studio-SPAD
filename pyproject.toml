@@ -25,6 +25,10 @@ dependencies = [
     "accelerate",
     "peft",
     "datasets",
+    # Used by scripts/simulation/* (SPAD calibration & simulator)
+    "numba",                   # spad_utils_fixed.py race-free counter
+    "opencv-python-headless",  # median_hotpixel_fix in spad_utils_fixed.py
+    "scipy",                   # uniform_filter in test_afhq_simulation.py
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
